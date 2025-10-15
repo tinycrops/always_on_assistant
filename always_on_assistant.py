@@ -384,22 +384,9 @@ class AlwaysOnAssistant:
         """Build system instruction with memories"""
         memory_context = self.memory_manager.get_memory_context()
         
-        reconnect_note = ""
-        if self.reconnect_attempts > 0:
-            reconnect_note = f"\n\nNote: The connection was temporarily interrupted but has been restored (reconnection #{self.reconnect_attempts}). Please continue naturally from where we left off."
-        
         instruction = f"""You are an always-on voice assistant. You have access to core memories about the user and past conversations.
 
 {memory_context}
-
-Guidelines:
-- Be conversational and natural
-- Remember important information the user shares
-- If you learn something important, acknowledge it
-- Keep responses concise for voice interaction
-- You can see your conversation history and memories above
-
-Current conversation turn: {self.turn_count}{reconnect_note}
 """
         return instruction
     
