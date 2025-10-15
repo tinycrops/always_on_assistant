@@ -32,8 +32,12 @@ except ImportError:
 from google import genai
 from google.genai import types
 
+# Import new memory system
+from memory_system import IntegratedMemorySystem
+
 # Configuration
-MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"  # Using the stable model
+MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"  # Voice model
+MEMORY_PROCESSOR_MODEL = "gemini-flash-latest"  # Memory processing model
 MEMORY_FILE = "assistant_memories.json"
 INTERACTION_LOG_DIR = "interaction_logs"
 AUDIO_RECORDINGS_DIR = "audio_recordings"
@@ -48,6 +52,10 @@ SAMPLE_WIDTH = 2
 # Context management
 MAX_TURNS_BEFORE_SUMMARIZE = 20  # Summarize and clear after this many turns
 WARNING_TURNS = 15  # Start warning about context at this point
+
+# Memory processing settings
+STM_MAX_TURNS = 20  # Maximum turns to keep in short-term memory
+MEMORY_PROCESS_THRESHOLD = 8  # Process STM to LTM after this many turns
 
 # Connection management
 MAX_RECONNECT_ATTEMPTS = 5  # Maximum number of reconnection attempts
@@ -270,6 +278,15 @@ class AlwaysOnAssistant:
             raise ValueError("GEMINI_API_KEY not found in environment")
         
         self.client = genai.Client(api_key=self.api_key)
+        
+        # New integrated memory system (replaces old MemoryManager)
+        self.memory_system = IntegratedMemorySystem(
+            api_key=self.api_key,
+            stm_max_turns=STM_MAX_TURNS,
+            process_threshold=MEMORY_PROCESS_THRESHOLD
+        )
+        
+        # Keep old memory manager for backwards compatibility (can be removed later)
         self.memory_manager = MemoryManager()
         self.interaction_logger = InteractionLogger()
         
@@ -382,12 +399,14 @@ class AlwaysOnAssistant:
     
     def _build_system_instruction(self) -> str:
         """Build system instruction with memories"""
-        memory_context = self.memory_manager.get_memory_context()
+        # Use new memory system for context
+        memory_context = self.memory_system.get_context_for_model()
         
-        instruction = f"""You are an always-on voice assistant. You have access to core memories about the user and past conversations.
+        instruction = f"""You are an always-on voice assistant. You have access to long-term memories about the user and recent conversation context.
 
 {memory_context}
-"""
+
+When the user shares important information about themselves, remember it naturally as part of our conversation. Your memories will be automatically updated in the background."""
         return instruction
     
     async def _text_input_loop(self):
@@ -403,6 +422,9 @@ class AlwaysOnAssistant:
                 if text.strip() and self.connection_active:
                     await self.send_queue.put({"text": text})
                     self.interaction_logger.log_interaction("user", text, {"mode": "text"})
+                    
+                    # Add to memory system
+                    self.memory_system.add_interaction("user", text, {"mode": "text"})
                     
             except CancelledError:
                 # Task was cancelled (e.g., during reconnection), this is expected
@@ -459,6 +481,9 @@ class AlwaysOnAssistant:
                         f"[Audio input: {filename}]",
                         {"mode": "audio", "filepath": str(filepath)}
                     )
+                    
+                    # Note: Audio transcripts would be added to memory when we receive them
+                    # For now, we'll rely on the assistant's text responses to capture context
                 
         except CancelledError:
             # Task was cancelled (e.g., during reconnection), this is expected
@@ -542,6 +567,13 @@ class AlwaysOnAssistant:
                 # Log the interaction
                 full_text = ''.join(text_response)
                 
+                # Add assistant response to memory system
+                if full_text.strip():
+                    self.memory_system.add_interaction("assistant", full_text, {"mode": "audio" if audio_chunks else "text"})
+                    
+                    # Process memories if threshold is reached
+                    await self.memory_system.process_if_ready()
+                
                 # Save audio if we got any
                 if audio_chunks:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -581,29 +613,22 @@ class AlwaysOnAssistant:
     
     async def _summarize_and_clear_context(self):
         """Summarize conversation and clear context to manage window size"""
-        self.logger.info("Context window getting full, requesting summary...")
+        self.logger.info("Context window getting full, processing memories...")
         
-        # Ask the model to summarize
-        summary_prompt = """Please provide a brief summary of our conversation so far, 
-        including any important facts or information I shared. Keep it concise."""
+        # Force process all pending memories to long-term storage
+        await self.memory_system.process_if_ready(force=True)
         
-        await self.send_queue.put({"text": summary_prompt})
+        # Get memory statistics
+        stats = self.memory_system.get_statistics()
+        self.logger.info(f"Memory stats: {stats}")
         
-        # Wait a bit for response
-        await asyncio.sleep(5)
-        
-        # Note: In a real implementation, you'd want to:
-        # 1. Capture the summary response specifically
-        # 2. Save it to memories
-        # 3. Actually restart the session with a fresh context
-        
-        # For now, just reset the counter and save a placeholder
-        self.memory_manager.add_conversation_summary(
-            f"Conversation summarized at turn {self.turn_count}"
-        )
-        
+        # Reset turn counter
         self.turn_count = 0
-        self.logger.info("Context summary saved, counter reset")
+        
+        # Optionally restart session with fresh context
+        # (This would require closing and reopening the session)
+        # For now, just note that memories have been processed
+        self.logger.info("Context processed, memories updated in long-term storage")
     
     async def _cleanup(self):
         """Cleanup resources"""
@@ -616,8 +641,16 @@ class AlwaysOnAssistant:
             if self.audio_player:
                 self.audio_player.cleanup()
         
-        # Save memories one last time
+        # Save memories one last time (old system)
         self.memory_manager.save_memories()
+        
+        # Process and save any remaining short-term memories
+        try:
+            await self.memory_system.process_if_ready(force=True)
+            self.logger.info("Final memory processing complete")
+        except Exception as e:
+            self.logger.error(f"Error in final memory processing: {e}")
+        
         self.logger.info("Shutdown complete")
 
 
