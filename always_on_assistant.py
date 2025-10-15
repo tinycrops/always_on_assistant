@@ -426,8 +426,8 @@ When the user shares important information about themselves, remember it natural
                     await self.send_queue.put({"text": text})
                     self.interaction_logger.log_interaction("user", text, {"mode": "text"})
                     
-                    # Add to memory system
-                    self.memory_system.add_interaction("user", text, {"mode": "text"})
+                    # Add to memory system (no audio file for text input)
+                    self.memory_system.add_interaction("user", text, {"mode": "text"}, audio_file_path=None)
                     
             except CancelledError:
                 # Task was cancelled (e.g., during reconnection), this is expected
@@ -485,8 +485,13 @@ When the user shares important information about themselves, remember it natural
                         {"mode": "audio", "filepath": str(filepath)}
                     )
                     
-                    # Note: Audio transcripts would be added to memory when we receive them
-                    # For now, we'll rely on the assistant's text responses to capture context
+                    # Add user audio to memory system with file path
+                    self.memory_system.add_interaction(
+                        "user",
+                        f"[Audio input: {filename}]",
+                        {"mode": "audio", "filepath": str(filepath)},
+                        audio_file_path=str(filepath)
+                    )
                 
         except CancelledError:
             # Task was cancelled (e.g., during reconnection), this is expected
@@ -570,14 +575,8 @@ When the user shares important information about themselves, remember it natural
                 # Log the interaction
                 full_text = ''.join(text_response)
                 
-                # Add assistant response to memory system
-                if full_text.strip():
-                    self.memory_system.add_interaction("assistant", full_text, {"mode": "audio" if audio_chunks else "text"})
-                    
-                    # Process memories in background (non-blocking)
-                    self._schedule_memory_processing()
-                
                 # Save audio if we got any
+                audio_path = None
                 if audio_chunks:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     audio_filename = f"assistant_response_{timestamp}.wav"
@@ -601,6 +600,19 @@ When the user shares important information about themselves, remember it natural
                         {"mode": "text"}
                     )
                     self.logger.info(f"Assistant responded: {full_text[:50]}...")
+                
+                # Add assistant response to memory system (with audio file if available)
+                if full_text.strip() or audio_path:
+                    content = full_text if full_text else "[Audio response]"
+                    self.memory_system.add_interaction(
+                        "assistant",
+                        content,
+                        {"mode": "audio" if audio_chunks else "text"},
+                        audio_file_path=str(audio_path) if audio_path else None
+                    )
+                    
+                    # Process memories in background (non-blocking)
+                    self._schedule_memory_processing()
                 
                 if not self.use_audio:
                     print()  # New line after response

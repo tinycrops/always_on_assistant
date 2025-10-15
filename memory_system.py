@@ -45,6 +45,7 @@ class ConversationTurn:
     content: str
     timestamp: str
     metadata: Dict[str, Any] = None
+    audio_file_path: Optional[str] = None  # Path to audio file if this is an audio turn
 
     def to_dict(self):
         return asdict(self)
@@ -77,13 +78,14 @@ class ShortTermMemory:
         self.turns: List[ConversationTurn] = []
         self.logger = logging.getLogger('ShortTermMemory')
     
-    def add_turn(self, role: str, content: str, metadata: Dict = None):
+    def add_turn(self, role: str, content: str, metadata: Dict = None, audio_file_path: str = None):
         """Add a conversation turn to short-term memory"""
         turn = ConversationTurn(
             role=role,
             content=content,
             timestamp=datetime.now().isoformat(),
-            metadata=metadata or {}
+            metadata=metadata or {},
+            audio_file_path=audio_file_path
         )
         self.turns.append(turn)
         
@@ -301,24 +303,62 @@ class MemoryProcessor:
     
     async def process_conversation(
         self, 
-        conversation_text: str,
+        conversation_turns: List[ConversationTurn],
         existing_memories_context: str = ""
     ) -> List[MemoryItem]:
         """
-        Process conversation text and extract important memories
+        Process conversation turns (text and/or audio) and extract important memories
         Returns list of MemoryItem objects
         """
         self.logger.info("Processing conversation for memory extraction...")
         
-        # Build prompt for memory extraction
-        prompt = self._build_extraction_prompt(conversation_text, existing_memories_context)
+        # Build content parts for the model
+        content_parts = []
         
+        # Add the extraction prompt first
+        prompt_text = self._build_extraction_prompt_header(existing_memories_context)
+        content_parts.append({"text": prompt_text})
+        
+        # Upload audio files and add to content
+        uploaded_files = []
         try:
+            for turn in conversation_turns:
+                # Add turn label
+                content_parts.append({"text": f"\n{turn.role.upper()}:"})
+                
+                # If there's an audio file, upload and add it
+                if turn.audio_file_path and Path(turn.audio_file_path).exists():
+                    self.logger.info(f"Uploading audio file: {turn.audio_file_path}")
+                    
+                    # Upload audio file using Files API
+                    uploaded_file = await asyncio.to_thread(
+                        self.client.files.upload,
+                        file=turn.audio_file_path
+                    )
+                    uploaded_files.append(uploaded_file)
+                    
+                    # Add file reference to content
+                    content_parts.append({
+                        "file_data": {
+                            "mime_type": uploaded_file.mime_type,
+                            "file_uri": uploaded_file.uri
+                        }
+                    })
+                    self.logger.info(f"Audio file uploaded: {uploaded_file.name}")
+                
+                # Also add text if available (transcripts or text responses)
+                if turn.content and not turn.content.startswith("[Audio"):
+                    content_parts.append({"text": turn.content})
+            
+            # Add final instruction
+            content_parts.append({"text": self._build_extraction_prompt_footer()})
+            
             # Use gemini-flash-latest for memory processing
+            self.logger.info(f"Sending {len(content_parts)} content parts to memory processor")
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model="gemini-flash-latest",
-                contents=prompt,
+                contents=content_parts,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
                     response_schema=self.memory_extraction_schema,
@@ -349,20 +389,34 @@ class MemoryProcessor:
             
         except Exception as e:
             self.logger.error(f"Error processing conversation: {e}")
+            import traceback
+            traceback.print_exc()
             return []
+        finally:
+            # Clean up uploaded files
+            for uploaded_file in uploaded_files:
+                try:
+                    await asyncio.to_thread(self.client.files.delete, name=uploaded_file.name)
+                    self.logger.debug(f"Deleted uploaded file: {uploaded_file.name}")
+                except Exception as e:
+                    self.logger.warning(f"Could not delete uploaded file {uploaded_file.name}: {e}")
     
-    def _build_extraction_prompt(self, conversation_text: str, existing_memories: str) -> str:
-        """Build the prompt for memory extraction"""
-        prompt = f"""You are a memory extraction system. Your job is to analyze conversations and extract important, memorable information about the user.
+    def _build_extraction_prompt_header(self, existing_memories: str) -> str:
+        """Build the header part of the extraction prompt"""
+        prompt = f"""You are a memory extraction system. Your job is to analyze conversations (text and/or audio) and extract important, memorable information about the user.
 
 EXISTING MEMORIES:
 {existing_memories if existing_memories else "No existing memories yet."}
 
-RECENT CONVERSATION:
-{conversation_text}
+RECENT CONVERSATION (text and audio will follow):"""
+        return prompt
+    
+    def _build_extraction_prompt_footer(self) -> str:
+        """Build the footer part of the extraction prompt with instructions"""
+        prompt = """
 
 TASK:
-Analyze the conversation and extract memories that meet these criteria:
+Analyze the conversation (including any audio recordings) and extract memories that meet these criteria:
 
 IMPORTANCE GUIDELINES:
 - CRITICAL: Core identity (name, occupation, location), life-changing goals, critical health info, deep values/beliefs
@@ -378,6 +432,7 @@ EXTRACTION RULES:
 5. Skip pleasantries, small talk, and trivial exchanges
 6. If the user corrects previous information, extract the correction
 7. Combine related information into coherent memory items
+8. For audio: transcribe and understand what was said, then extract memories from the content
 
 CATEGORIES:
 - personal_info: Name, age, occupation, location, family, identity
@@ -390,7 +445,6 @@ CATEGORIES:
 - other: Anything else important that doesn't fit above
 
 Return ONLY the memories you extract. If nothing important to remember, return an empty memories array."""
-
         return prompt
     
     async def consolidate_memories(
@@ -493,17 +547,14 @@ class IntegratedMemorySystem:
         
         self.logger = logging.getLogger('IntegratedMemorySystem')
     
-    def add_interaction(self, role: str, content: str, metadata: Dict = None):
+    def add_interaction(self, role: str, content: str, metadata: Dict = None, audio_file_path: str = None):
         """Add an interaction to short-term memory"""
-        # Skip empty or very short interactions
-        if not content or len(content.strip()) < 3:
+        # Skip empty interactions if no audio
+        if not audio_file_path and (not content or len(content.strip()) < 3):
             return
         
-        # Skip purely audio references
-        if content.startswith("[Audio") and content.endswith("]"):
-            return
-        
-        self.short_term.add_turn(role, content, metadata)
+        # Don't skip audio references anymore - we'll process the audio file
+        self.short_term.add_turn(role, content, metadata, audio_file_path)
         self.turns_since_processing += 1
     
     async def process_if_ready(self, force: bool = False) -> bool:
@@ -519,15 +570,15 @@ class IntegratedMemorySystem:
         
         self.logger.info("Processing short-term memory...")
         
-        # Get conversation text
-        conversation_text = self.short_term.get_conversation_text()
+        # Get conversation turns (includes audio file paths)
+        conversation_turns = self.short_term.get_recent_conversation()
         
         # Get existing memories for context (avoid duplicates)
         existing_context = self.long_term.format_for_context(max_items_per_category=10)
         
-        # Extract memories
+        # Extract memories (now with audio support)
         new_memories = await self.processor.process_conversation(
-            conversation_text,
+            conversation_turns,
             existing_context
         )
         
@@ -545,6 +596,8 @@ class IntegratedMemorySystem:
             # Add to long-term memory
             self.long_term.add_memories_batch(important_memories)
             self.logger.info(f"Moved {len(important_memories)} important memories to long-term storage")
+        else:
+            self.logger.info("No important memories extracted from recent conversation")
         
         # Clear processed turns from short-term memory
         num_to_clear = len(self.short_term.turns) // 2  # Keep half for context
