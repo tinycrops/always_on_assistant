@@ -45,13 +45,13 @@ More details about this new SDK on the [documentation](https://ai.google.dev/gem
 
 """### Setup your API key
 
-To run the following cell, your API key must be stored it in a Colab Secret named `GOOGLE_API_KEY`. If you don't already have an API key, or you're not sure how to create a Colab Secret, see [Authentication](../quickstarts/Authentication.ipynb) for an example.
+To run the following cell, your API key must be stored it in a Colab Secret named `GEMINI_API_KEY`. If you don't already have an API key, or you're not sure how to create a Colab Secret, see [Authentication](../quickstarts/Authentication.ipynb) for an example.
 """
 
 from google.colab import userdata
 import os
 
-os.environ['GOOGLE_API_KEY']=userdata.get('GOOGLE_API_KEY')
+os.environ['GEMINI_API_KEY']=userdata.get('GEMINI_API_KEY')
 
 """### Initialize SDK client
 

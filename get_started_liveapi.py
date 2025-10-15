@@ -55,13 +55,13 @@ More details about this new SDK on the [documentation](https://ai.google.dev/gem
 
 """### Set up your API key
 
-To run the following cell, your API key must be stored in a Colab Secret named `GOOGLE_API_KEY`. If you don't already have an API key, or you're not sure how to create a Colab Secret, see [Authentication](../quickstarts/Authentication.ipynb) for an example.
+To run the following cell, your API key must be stored in a Colab Secret named `GEMINI_API_KEY`. If you don't already have an API key, or you're not sure how to create a Colab Secret, see [Authentication](../quickstarts/Authentication.ipynb) for an example.
 """
 
 from google.colab import userdata
 import os
 
-os.environ['GOOGLE_API_KEY'] = userdata.get('GOOGLE_API_KEY')
+os.environ['GEMINI_API_KEY'] = userdata.get('GEMINI_API_KEY')
 
 """### Initialize SDK client
 
@@ -70,7 +70,7 @@ The client will pick up your API key from the environment variable.
 
 from google import genai
 from google.genai import types
-client = genai.Client(api_key=GOOGLE_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 """### Select a model
 
@@ -310,7 +310,7 @@ last_handle = None
 
 MODEL =  "gemini-live-2.5-flash-preview"
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 async def async_enumerate(aiterable):
   n=0

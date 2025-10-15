@@ -1,0 +1,15 @@
+audio_recordings/
+interaction_logs/ 
+starter-applets/
+.env
+assistant_memories.json
+.project_summary.txt
+AUDIO_FIX_NOTES.md
+CHANGELOG.md
+INSTALL.md
+PROJECT_OVERVIEW.md
+QUICKSTART.md
+README.md
+RECONNECTION_FEATURE.md
+test_audio_encoding.py
+verify_setup.py

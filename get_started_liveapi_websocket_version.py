@@ -59,11 +59,11 @@ from IPython.display import display, Audio
 
 """### Constants
 
-To run the following cell, your API key must be stored in a Colab Secret named `GOOGLE_API_KEY`. If you don't already have an API key, or you're not sure how to create a Colab Secret, see [Authentication](../../quickstarts/Authentication.ipynb) for an example.
+To run the following cell, your API key must be stored in a Colab Secret named `GEMINI_API_KEY`. If you don't already have an API key, or you're not sure how to create a Colab Secret, see [Authentication](../../quickstarts/Authentication.ipynb) for an example.
 """
 
 from google.colab import userdata
-os.environ['GOOGLE_API_KEY'] = userdata.get('GOOGLE_API_KEY')
+os.environ['GEMINI_API_KEY'] = userdata.get('GEMINI_API_KEY')
 
 """Multimodal Live API are a new capability introduced with the [Gemini 2.0](https://ai.google.dev/gemini-api/docs/models/gemini-v2) model so only works with this model. You need to use the  `v1alpha` client version.
 
@@ -73,7 +73,7 @@ MODEL = 'models/gemini-2.0-flash-exp'
 
 HOST='generativelanguage.googleapis.com'
 
-URI = f'wss://{HOST}/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={os.environ["GOOGLE_API_KEY"]}'
+URI = f'wss://{HOST}/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key={os.environ["GEMINI_API_KEY"]}'
 
 """### Logging
 
