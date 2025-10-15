@@ -310,6 +310,9 @@ class AlwaysOnAssistant:
         self.max_reconnect_attempts = MAX_RECONNECT_ATTEMPTS
         self.initial_reconnect_delay = INITIAL_RECONNECT_DELAY
         
+        # Background memory processing task
+        self.memory_processing_task = None
+        
         # Setup logging
         logging.basicConfig(
             level=logging.INFO,
@@ -571,8 +574,8 @@ When the user shares important information about themselves, remember it natural
                 if full_text.strip():
                     self.memory_system.add_interaction("assistant", full_text, {"mode": "audio" if audio_chunks else "text"})
                     
-                    # Process memories if threshold is reached
-                    await self.memory_system.process_if_ready()
+                    # Process memories in background (non-blocking)
+                    self._schedule_memory_processing()
                 
                 # Save audio if we got any
                 if audio_chunks:
@@ -611,11 +614,34 @@ When the user shares important information about themselves, remember it natural
             traceback.print_exc()
             raise
     
+    def _schedule_memory_processing(self):
+        """Schedule memory processing as a background task (non-blocking)"""
+        # Cancel any existing processing task
+        if self.memory_processing_task and not self.memory_processing_task.done():
+            self.logger.debug("Memory processing already in progress, skipping")
+            return
+        
+        # Create new background task
+        self.memory_processing_task = asyncio.create_task(self._process_memories_background())
+    
+    async def _process_memories_background(self):
+        """Process memories in the background without blocking responses"""
+        try:
+            self.logger.debug("Starting background memory processing...")
+            processed = await self.memory_system.process_if_ready()
+            
+            if processed:
+                stats = self.memory_system.get_statistics()
+                self.logger.info(f"Background memory processing complete. Stats: {stats}")
+        except Exception as e:
+            self.logger.error(f"Error in background memory processing: {e}")
+            # Don't crash the assistant if memory processing fails
+    
     async def _summarize_and_clear_context(self):
         """Summarize conversation and clear context to manage window size"""
         self.logger.info("Context window getting full, processing memories...")
         
-        # Force process all pending memories to long-term storage
+        # Force process all pending memories to long-term storage (blocking this time)
         await self.memory_system.process_if_ready(force=True)
         
         # Get memory statistics
@@ -640,6 +666,15 @@ When the user shares important information about themselves, remember it natural
                 self.audio_recorder.cleanup()
             if self.audio_player:
                 self.audio_player.cleanup()
+        
+        # Cancel any ongoing background memory processing
+        if self.memory_processing_task and not self.memory_processing_task.done():
+            self.logger.info("Waiting for background memory processing to complete...")
+            try:
+                await asyncio.wait_for(self.memory_processing_task, timeout=10.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("Background memory processing timed out")
+                self.memory_processing_task.cancel()
         
         # Save memories one last time (old system)
         self.memory_manager.save_memories()
