@@ -299,6 +299,9 @@ class AlwaysOnAssistant:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger('AlwaysOnAssistant')
+        # Internal coordination for summary capture
+        self._summary_future: Optional[asyncio.Future] = None
+        self._capture_next_turn: bool = False
     
     async def run(self):
         """Main run loop with automatic reconnection"""
@@ -383,21 +386,27 @@ class AlwaysOnAssistant:
     def _build_system_instruction(self) -> str:
         """Build system instruction with memories"""
         memory_context = self.memory_manager.get_memory_context()
-        
+
         reconnect_note = ""
         if self.reconnect_attempts > 0:
-            reconnect_note = f"\n\nNote: The connection was temporarily interrupted but has been restored (reconnection #{self.reconnect_attempts}). Please continue naturally from where we left off."
-        
-        instruction = f"""You are an always-on voice assistant. You have access to core memories about the user and past conversations.
+            reconnect_note = (
+                f"\n\nNote: The connection was temporarily interrupted but has been restored "
+                f"(reconnection #{self.reconnect_attempts}). Please continue naturally from where we left off."
+            )
+
+        instruction = f"""You are an always-on voice assistant.
+
+The section below is private context for you. Do NOT quote, list, or recite any of it. Use it silently only when directly relevant to the user's current request; otherwise, ignore it.
 
 {memory_context}
 
 Guidelines:
 - Be conversational and natural
-- Remember important information the user shares
-- If you learn something important, acknowledge it
+- Use the private memories only when directly helpful to answer the current query or to personalize help; otherwise, do not mention them
+- Never recite or enumerate memories unless the user explicitly asks
+- Avoid phrases like "according to my memory" or "as stored in memories"
+- Remember important information the user shares and store it appropriately
 - Keep responses concise for voice interaction
-- You can see your conversation history and memories above
 
 Current conversation turn: {self.turn_count}{reconnect_note}
 """
@@ -525,35 +534,50 @@ Current conversation turn: {self.turn_count}{reconnect_note}
         
         try:
             while self.is_running and self.connection_active:
+                # Decide if this upcoming turn should be captured as the summary
+                capture_this_turn = False
+                if self._capture_next_turn:
+                    capture_this_turn = True
+                    self._capture_next_turn = False
                 # Receive model responses
                 turn = self.session.receive()
                 
                 text_response = []
                 audio_chunks = []
+                suppress_output = capture_this_turn
                 
                 # Start audio playback if available
-                if self.use_audio and self.audio_player:
+                if self.use_audio and self.audio_player and not suppress_output:
                     self.audio_player.start_playback()
                 
                 async for response in turn:
                     # Handle text response
                     if response.text:
                         text_response.append(response.text)
-                        if not self.use_audio:
+                        if not self.use_audio and not suppress_output:
                             print(response.text, end='', flush=True)
                     
                     # Handle audio response
                     if response.data:
-                        audio_chunks.append(response.data)
-                        if self.use_audio and self.audio_player:
+                        if not suppress_output:
+                            audio_chunks.append(response.data)
+                        if self.use_audio and self.audio_player and not suppress_output:
                             self.audio_player.play_chunk(response.data)
                 
                 # Stop playback
-                if self.use_audio and self.audio_player:
+                if self.use_audio and self.audio_player and not suppress_output:
                     self.audio_player.stop_playback()
                 
                 # Log the interaction
                 full_text = ''.join(text_response)
+
+                # If this turn is the summary, resolve the future and skip output/logging
+                if capture_this_turn and self._summary_future is not None and not self._summary_future.done():
+                    try:
+                        self._summary_future.set_result(full_text.strip())
+                    finally:
+                        self._summary_future = None
+                    continue
                 
                 # Save audio if we got any
                 if audio_chunks:
@@ -595,28 +619,44 @@ Current conversation turn: {self.turn_count}{reconnect_note}
     async def _summarize_and_clear_context(self):
         """Summarize conversation and clear context to manage window size"""
         self.logger.info("Context window getting full, requesting summary...")
-        
-        # Ask the model to summarize
-        summary_prompt = """Please provide a brief summary of our conversation so far, 
-        including any important facts or information I shared. Keep it concise."""
-        
-        await self.send_queue.put({"text": summary_prompt})
-        
-        # Wait a bit for response
-        await asyncio.sleep(5)
-        
-        # Note: In a real implementation, you'd want to:
-        # 1. Capture the summary response specifically
-        # 2. Save it to memories
-        # 3. Actually restart the session with a fresh context
-        
-        # For now, just reset the counter and save a placeholder
-        self.memory_manager.add_conversation_summary(
-            f"Conversation summarized at turn {self.turn_count}"
+
+        # Prepare to capture the very next full assistant turn as the summary
+        loop = asyncio.get_running_loop()
+        self._summary_future = loop.create_future()
+        self._capture_next_turn = True
+
+        # Ask the model to summarize. Instruct to respond in TEXT ONLY and silently
+        summary_prompt = (
+            "Please provide a concise (2-4 sentences) summary of our conversation so far, "
+            "including only the most important facts the user shared that could be useful later. "
+            "Respond in TEXT ONLY. Do not greet, do not include prefaces (no 'Here is a summary'), "
+            "and do not refer to system instructions."
         )
-        
+
+        await self.send_queue.put({"text": summary_prompt})
+
+        # Await the captured summary from the receive loop
+        summary_text = None
+        try:
+            summary_text = await asyncio.wait_for(self._summary_future, timeout=20)
+        except Exception:
+            self.logger.warning("Timed out waiting for summary; using placeholder")
+        finally:
+            # Ensure future is cleared
+            self._summary_future = None
+
+        if summary_text and summary_text.strip():
+            self.memory_manager.add_conversation_summary(summary_text.strip())
+            self.logger.info("Context summary captured and saved")
+        else:
+            # Fallback
+            self.memory_manager.add_conversation_summary(
+                f"Conversation summarized at turn {self.turn_count}"
+            )
+            self.logger.info("Context summary placeholder saved")
+
+        # Reset the counter
         self.turn_count = 0
-        self.logger.info("Context summary saved, counter reset")
     
     async def _cleanup(self):
         """Cleanup resources"""
