@@ -312,6 +312,8 @@ class AlwaysOnAssistant:
         
         # Background memory processing task
         self.memory_processing_task = None
+        self.memory_processing_queue = asyncio.Queue()
+        self.memory_processor_running = False
         
         # Setup logging
         logging.basicConfig(
@@ -324,6 +326,9 @@ class AlwaysOnAssistant:
         """Main run loop with automatic reconnection"""
         self.is_running = True
         self.logger.info("Starting Always-On Assistant...")
+        
+        # Start background memory processor
+        self.memory_processing_task = asyncio.create_task(self._memory_processor_loop())
         
         try:
             while self.is_running:
@@ -627,27 +632,44 @@ When the user shares important information about themselves, remember it natural
             raise
     
     def _schedule_memory_processing(self):
-        """Schedule memory processing as a background task (non-blocking)"""
-        # Cancel any existing processing task
-        if self.memory_processing_task and not self.memory_processing_task.done():
-            self.logger.debug("Memory processing already in progress, skipping")
-            return
-        
-        # Create new background task
-        self.memory_processing_task = asyncio.create_task(self._process_memories_background())
-    
-    async def _process_memories_background(self):
-        """Process memories in the background without blocking responses"""
+        """Queue a memory processing request (non-blocking)"""
         try:
-            self.logger.debug("Starting background memory processing...")
-            processed = await self.memory_system.process_if_ready()
-            
-            if processed:
-                stats = self.memory_system.get_statistics()
-                self.logger.info(f"Background memory processing complete. Stats: {stats}")
-        except Exception as e:
-            self.logger.error(f"Error in background memory processing: {e}")
-            # Don't crash the assistant if memory processing fails
+            # Non-blocking put - just queue it
+            self.memory_processing_queue.put_nowait("process")
+            self.logger.debug("Memory processing request queued")
+        except asyncio.QueueFull:
+            self.logger.debug("Memory processing queue full, skipping")
+    
+    async def _memory_processor_loop(self):
+        """Background loop that processes memory requests from queue"""
+        self.logger.info("Memory processor loop started")
+        
+        while self.is_running:
+            try:
+                # Wait for a processing request (with timeout to check is_running)
+                try:
+                    await asyncio.wait_for(self.memory_processing_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                
+                # Process memories
+                self.logger.debug("Processing memories from queue...")
+                processed = await self.memory_system.process_if_ready()
+                
+                if processed:
+                    stats = self.memory_system.get_statistics()
+                    self.logger.info(f"Memory processing complete. Stats: {stats}")
+                
+                # Small delay to avoid hammering the API
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                self.logger.error(f"Error in memory processor loop: {e}")
+                traceback.print_exc()
+                # Continue running even on error
+                await asyncio.sleep(1.0)
+        
+        self.logger.info("Memory processor loop stopped")
     
     async def _summarize_and_clear_context(self):
         """Summarize conversation and clear context to manage window size"""
@@ -679,24 +701,25 @@ When the user shares important information about themselves, remember it natural
             if self.audio_player:
                 self.audio_player.cleanup()
         
-        # Cancel any ongoing background memory processing
+        # Signal memory processor to stop and wait for it
         if self.memory_processing_task and not self.memory_processing_task.done():
-            self.logger.info("Waiting for background memory processing to complete...")
+            self.logger.info("Waiting for memory processor to finish...")
             try:
-                await asyncio.wait_for(self.memory_processing_task, timeout=10.0)
+                # Queue final processing request
+                await self.memory_system.process_if_ready(force=True)
+                
+                # Wait for memory processor task to complete
+                await asyncio.wait_for(self.memory_processing_task, timeout=15.0)
             except asyncio.TimeoutError:
-                self.logger.warning("Background memory processing timed out")
+                self.logger.warning("Memory processor timed out, cancelling")
                 self.memory_processing_task.cancel()
+                try:
+                    await self.memory_processing_task
+                except CancelledError:
+                    pass
         
         # Save memories one last time (old system)
         self.memory_manager.save_memories()
-        
-        # Process and save any remaining short-term memories
-        try:
-            await self.memory_system.process_if_ready(force=True)
-            self.logger.info("Final memory processing complete")
-        except Exception as e:
-            self.logger.error(f"Error in final memory processing: {e}")
         
         self.logger.info("Shutdown complete")
 

@@ -8,9 +8,11 @@ Uses gemini-flash-latest for memory processing with structured outputs
 import asyncio
 import json
 import logging
+import wave
+import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from enum import Enum
 
@@ -261,6 +263,8 @@ class MemoryProcessor:
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
         self.logger = logging.getLogger('MemoryProcessor')
+        self.temp_dir = Path(tempfile.gettempdir()) / "assistant_memory_audio"
+        self.temp_dir.mkdir(exist_ok=True)
         
         # Define structured output schema for memory extraction
         self.memory_extraction_schema = {
@@ -301,6 +305,58 @@ class MemoryProcessor:
             "required": ["memories", "reasoning"]
         }
     
+    def _consolidate_audio_by_role(self, conversation_turns: List[ConversationTurn]) -> Dict[str, Optional[str]]:
+        """
+        Consolidate audio files by role (user vs assistant) into single files
+        Returns dict with 'user' and 'assistant' keys pointing to consolidated file paths
+        """
+        consolidated = {"user": None, "assistant": None}
+        
+        for role in ["user", "assistant"]:
+            # Collect all audio files for this role
+            audio_files = []
+            for turn in conversation_turns:
+                if turn.role == role and turn.audio_file_path and Path(turn.audio_file_path).exists():
+                    audio_files.append(turn.audio_file_path)
+            
+            if not audio_files:
+                continue
+            
+            # Consolidate audio files
+            try:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                output_path = self.temp_dir / f"consolidated_{role}_{timestamp}.wav"
+                
+                # Read all audio files and concatenate
+                combined_frames = []
+                params = None
+                
+                for audio_file in audio_files:
+                    try:
+                        with wave.open(audio_file, 'rb') as wf:
+                            if params is None:
+                                params = wf.getparams()
+                            frames = wf.readframes(wf.getnframes())
+                            combined_frames.append(frames)
+                    except Exception as e:
+                        self.logger.warning(f"Could not read audio file {audio_file}: {e}")
+                        continue
+                
+                if combined_frames and params:
+                    # Write consolidated file
+                    with wave.open(str(output_path), 'wb') as wf:
+                        wf.setparams(params)
+                        for frames in combined_frames:
+                            wf.writeframes(frames)
+                    
+                    consolidated[role] = str(output_path)
+                    self.logger.info(f"Consolidated {len(audio_files)} {role} audio files into {output_path.name}")
+            
+            except Exception as e:
+                self.logger.error(f"Error consolidating {role} audio: {e}")
+        
+        return consolidated
+    
     async def process_conversation(
         self, 
         conversation_turns: List[ConversationTurn],
@@ -312,6 +368,9 @@ class MemoryProcessor:
         """
         self.logger.info("Processing conversation for memory extraction...")
         
+        # First, consolidate audio files by role (more efficient)
+        consolidated_audio = self._consolidate_audio_by_role(conversation_turns)
+        
         # Build content parts for the model
         content_parts = []
         
@@ -319,42 +378,62 @@ class MemoryProcessor:
         prompt_text = self._build_extraction_prompt_header(existing_memories_context)
         content_parts.append({"text": prompt_text})
         
-        # Upload audio files and add to content
+        # Upload consolidated audio files
         uploaded_files = []
+        consolidated_files_to_delete = []
+        
         try:
+            # Upload and add USER audio first (if exists)
+            if consolidated_audio["user"]:
+                content_parts.append({"text": "\n=== USER AUDIO (consolidated) ==="})
+                
+                self.logger.info(f"Uploading consolidated user audio: {consolidated_audio['user']}")
+                uploaded_file = await asyncio.to_thread(
+                    self.client.files.upload,
+                    file=consolidated_audio["user"]
+                )
+                uploaded_files.append(uploaded_file)
+                consolidated_files_to_delete.append(consolidated_audio["user"])
+                
+                content_parts.append({
+                    "file_data": {
+                        "mime_type": uploaded_file.mime_type,
+                        "file_uri": uploaded_file.uri
+                    }
+                })
+                self.logger.info(f"User audio uploaded: {uploaded_file.name}")
+            
+            # Upload and add ASSISTANT audio (if exists)
+            if consolidated_audio["assistant"]:
+                content_parts.append({"text": "\n=== ASSISTANT AUDIO (consolidated) ==="})
+                
+                self.logger.info(f"Uploading consolidated assistant audio: {consolidated_audio['assistant']}")
+                uploaded_file = await asyncio.to_thread(
+                    self.client.files.upload,
+                    file=consolidated_audio["assistant"]
+                )
+                uploaded_files.append(uploaded_file)
+                consolidated_files_to_delete.append(consolidated_audio["assistant"])
+                
+                content_parts.append({
+                    "file_data": {
+                        "mime_type": uploaded_file.mime_type,
+                        "file_uri": uploaded_file.uri
+                    }
+                })
+                self.logger.info(f"Assistant audio uploaded: {uploaded_file.name}")
+            
+            # Add text content from turns (for context)
+            content_parts.append({"text": "\n=== TEXT CONTEXT ==="})
             for turn in conversation_turns:
-                # Add turn label
-                content_parts.append({"text": f"\n{turn.role.upper()}:"})
-                
-                # If there's an audio file, upload and add it
-                if turn.audio_file_path and Path(turn.audio_file_path).exists():
-                    self.logger.info(f"Uploading audio file: {turn.audio_file_path}")
-                    
-                    # Upload audio file using Files API
-                    uploaded_file = await asyncio.to_thread(
-                        self.client.files.upload,
-                        file=turn.audio_file_path
-                    )
-                    uploaded_files.append(uploaded_file)
-                    
-                    # Add file reference to content
-                    content_parts.append({
-                        "file_data": {
-                            "mime_type": uploaded_file.mime_type,
-                            "file_uri": uploaded_file.uri
-                        }
-                    })
-                    self.logger.info(f"Audio file uploaded: {uploaded_file.name}")
-                
-                # Also add text if available (transcripts or text responses)
                 if turn.content and not turn.content.startswith("[Audio"):
-                    content_parts.append({"text": turn.content})
+                    content_parts.append({"text": f"{turn.role.upper()}: {turn.content}"})
             
             # Add final instruction
             content_parts.append({"text": self._build_extraction_prompt_footer()})
             
             # Use gemini-flash-latest for memory processing
-            self.logger.info(f"Sending {len(content_parts)} content parts to memory processor")
+            self.logger.info(f"Sending {len(content_parts)} content parts (with {len(uploaded_files)} audio files) to memory processor")
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model="gemini-flash-latest",
@@ -393,13 +472,21 @@ class MemoryProcessor:
             traceback.print_exc()
             return []
         finally:
-            # Clean up uploaded files
+            # Clean up uploaded files from Gemini
             for uploaded_file in uploaded_files:
                 try:
                     await asyncio.to_thread(self.client.files.delete, name=uploaded_file.name)
                     self.logger.debug(f"Deleted uploaded file: {uploaded_file.name}")
                 except Exception as e:
                     self.logger.warning(f"Could not delete uploaded file {uploaded_file.name}: {e}")
+            
+            # Clean up temporary consolidated audio files
+            for temp_file in consolidated_files_to_delete:
+                try:
+                    Path(temp_file).unlink()
+                    self.logger.debug(f"Deleted temporary consolidated file: {temp_file}")
+                except Exception as e:
+                    self.logger.warning(f"Could not delete temp file {temp_file}: {e}")
     
     def _build_extraction_prompt_header(self, existing_memories: str) -> str:
         """Build the header part of the extraction prompt"""
